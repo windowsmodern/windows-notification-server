@@ -553,6 +553,44 @@ static bool SendCommandToInstance (const std::wstring &cmd, std::wstring &outRep
 }
 
 // ============================================================
+// 兼容 Windows XP：CancelIoEx 是 Vista 之后才提供的 API
+// ============================================================
+typedef BOOL (WINAPI *PFN_CancelIoEx) (HANDLE hFile, LPOVERLAPPED lpOverlapped);
+
+// 运行时解析 CancelIoEx，不要在导入表里留下 Vista 及以上系统的入口点，
+// 否则 Windows XP 的加载器会直接报“无法定位程序输入点”。
+static PFN_CancelIoEx GetCancelIoExProc ()
+{
+	static PFN_CancelIoEx s_pfnCancelIoEx = NULL;
+	static bool s_resolved = false;
+	if (!s_resolved)
+	{
+		HMODULE hKernel32 = GetModuleHandleW (L"kernel32.dll");
+		if (hKernel32)
+			s_pfnCancelIoEx = (PFN_CancelIoEx)GetProcAddress (hKernel32, "CancelIoEx");
+		s_resolved = true;
+	}
+	return s_pfnCancelIoEx;
+}
+
+// 取消句柄上挂起的重叠 IO。
+// Windows XP / Server 2003 没有 CancelIoEx，退化为 CancelIo：此处挂起的
+// ConnectNamedPipe 正是由本线程自己发起的，CancelIo 足以把它取消。
+static void CancelPendingIo (HANDLE hFile, LPOVERLAPPED lpOverlapped)
+{
+	PFN_CancelIoEx pfnCancelIoEx = GetCancelIoExProc ();
+	if (pfnCancelIoEx)
+		pfnCancelIoEx (hFile, lpOverlapped);
+	else
+		::CancelIo (hFile);
+
+	// 等取消真正完成再返回，避免 IO 仍挂起时就关闭句柄
+	if (lpOverlapped && lpOverlapped->hEvent)
+		WaitForSingleObject (lpOverlapped->hEvent, 1000);
+}
+
+
+// ============================================================
 // 管道 IPC：服务器线程
 // ============================================================
 static DWORD WINAPI PipeServerThread (LPVOID)
@@ -582,7 +620,7 @@ static DWORD WINAPI PipeServerThread (LPVOID)
 			DWORD w = WaitForMultipleObjects (2, handles, FALSE, INFINITE);
 			if (w == WAIT_OBJECT_0 + 1)
 			{
-				CancelIoEx (hPipe, &ov);
+				CancelPendingIo (hPipe, &ov);
 				CloseHandle (ov.hEvent);
 				CloseHandle (hPipe);
 				break;
